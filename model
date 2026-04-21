@@ -1,0 +1,283 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import timm
+from utils.ASPPGCN import ASPPGraphFusion
+
+
+class MultiChannelEdgeExtractor(nn.Module):
+    def __init__(self, out_channels_full=64, out_channels_half=64):
+        super().__init__()
+        self.out_channels_full = out_channels_full
+        self.out_channels_half = out_channels_half
+
+        # RGB 分支
+        self.rgb_full = nn.Conv2d(3, out_channels_full, kernel_size=3, padding=1)
+        self.rgb_half = nn.Conv2d(3, out_channels_half, kernel_size=3, stride=2, padding=1)
+
+        # 灰度分支
+        self.gray_full = nn.Conv2d(1, out_channels_full, kernel_size=3, padding=1)
+        self.gray_half = nn.Conv2d(1, out_channels_half, kernel_size=3, stride=2, padding=1)
+
+        # 空间门控融合
+        self.gate_full = nn.Conv2d(out_channels_full * 2, 2, kernel_size=3, padding=1)
+        self.gate_half = nn.Conv2d(out_channels_half * 2, 2, kernel_size=3, padding=1)
+
+        self._init_edge_weights()
+
+    def _init_edge_weights(self):
+        sobel_x = torch.tensor([[-1, 0, 1],
+                                [-2, 0, 2],
+                                [-1, 0, 1]], dtype=torch.float32) / 8.0
+        sobel_y = sobel_x.t()
+
+        with torch.no_grad():
+            # Gray
+            sobel_gray = torch.stack([sobel_x, sobel_y], dim=0).unsqueeze(1)
+            self.gray_full.weight[:2] = sobel_gray
+            if self.gray_full.weight.shape[0] > 2:
+                nn.init.kaiming_normal_(self.gray_full.weight[2:], mode='fan_out')
+            self.gray_half.weight[:2] = sobel_gray
+            if self.gray_half.weight.shape[0] > 2:
+                nn.init.kaiming_normal_(self.gray_half.weight[2:], mode='fan_out')
+
+            # RGB
+            sobel_rgb = torch.zeros(6, 3, 3, 3)
+            for c in range(3):
+                sobel_rgb[2 * c, c] = sobel_x
+                sobel_rgb[2 * c + 1, c] = sobel_y
+            self.rgb_full.weight[:6] = sobel_rgb
+            if self.rgb_full.weight.shape[0] > 6:
+                nn.init.kaiming_normal_(self.rgb_full.weight[6:], mode='fan_out')
+            self.rgb_half.weight[:6] = sobel_rgb
+            if self.rgb_half.weight.shape[0] > 6:
+                nn.init.kaiming_normal_(self.rgb_half.weight[6:], mode='fan_out')
+
+    def forward(self, x):
+        gray = 0.2989 * x[:, 0:1] + 0.5870 * x[:, 1:2] + 0.1140 * x[:, 2:3]
+
+        rgb_f = self.rgb_full(x)
+        gray_f = self.gray_full(gray)
+        rgb_h = self.rgb_half(x)
+        gray_h = self.gray_half(gray)
+
+        full_cat = torch.cat([rgb_f, gray_f], dim=1)
+        gate_full = torch.sigmoid(self.gate_full(full_cat))
+        full_fused = gate_full[:, :1] * rgb_f + gate_full[:, 1:] * gray_f
+
+        half_cat = torch.cat([rgb_h, gray_h], dim=1)
+        gate_half = torch.sigmoid(self.gate_half(half_cat))
+        half_fused = gate_half[:, :1] * rgb_h + gate_half[:, 1:] * gray_h
+
+        return {'full': full_fused, 'half': half_fused}
+
+
+class EnhancedSES(nn.Module):
+    def __init__(self, shallow_ch, hf_ch, target_ch):
+        super().__init__()
+        self.fuse = nn.Sequential(
+            nn.Conv2d(shallow_ch + hf_ch, target_ch, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(target_ch, target_ch, kernel_size=3, padding=1)
+        )
+
+    def forward(self, shallow_feat, hf_feat):
+        if shallow_feat.shape[2:] != hf_feat.shape[2:]:
+            hf_feat = F.interpolate(hf_feat, size=shallow_feat.shape[2:], mode='bilinear', align_corners=False)
+        fused = torch.cat([shallow_feat, hf_feat], dim=1)
+        return self.fuse(fused)
+
+
+
+class EnhancedConvBlock_LS(nn.Module):
+    def __init__(
+            self,
+            in_channels,
+            out_channels,
+            dropout_prob=0.3,
+            use_se=False,
+            layer_scale_init_value=1e-6
+    ):
+        super().__init__()
+        self.use_residual = (in_channels == out_channels)
+        self.dwconv = nn.Conv2d(in_channels, in_channels, kernel_size=7, padding=3, groups=in_channels)
+        self.norm = nn.GroupNorm(1, in_channels)
+        self.pwconv1 = nn.Conv2d(in_channels, 4 * in_channels, kernel_size=1)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout2d(dropout_prob)
+        self.pwconv2 = nn.Conv2d(4 * in_channels, out_channels, kernel_size=1)
+
+        if use_se:
+            reduced_ch = max(out_channels // 8, 1)
+            self.se = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(out_channels, reduced_ch, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(reduced_ch, out_channels, 1),
+                nn.Sigmoid()
+            )
+        else:
+            self.se = None
+
+        if layer_scale_init_value > 0:
+            self.gamma = nn.Parameter(
+                layer_scale_init_value * torch.ones(out_channels, 1, 1),
+                requires_grad=True
+            )
+        else:
+            self.gamma = None
+
+        if not self.use_residual:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        identity = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        if self.se is not None:
+            x = x * self.se(x)
+        if self.use_residual:
+            return x + identity
+        else:
+            return x + self.shortcut(identity)
+
+
+class DecoderStage(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels, dropout_prob=0.3, use_se=False):
+        super().__init__()
+        self.upconv = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        fusion_in = out_channels + skip_channels
+        self.process_block = nn.Sequential(
+            EnhancedConvBlock_LS(fusion_in, out_channels, 0, False, 1e-6),
+            EnhancedConvBlock_LS(out_channels, out_channels, 0, False, 1e-6),
+            EnhancedConvBlock_LS(out_channels, out_channels, 0, False, 1e-6),
+            EnhancedConvBlock_LS(out_channels, out_channels, 0, False, 1e-6)
+        )
+
+    def forward(self, x, skip):
+        x = self.upconv(x)
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.process_block(x)
+
+
+class ConvNeXtUNet_EGSES(nn.Module):
+    def __init__(
+            self,
+            num_classes,
+            backbone_name='convnextv2_base',
+            pretrained=True,
+            weight_path="./convnextv2_base_in22k_ft_2.pth",
+            freeze_encoder=False,
+            dropout_prob=0.2
+    ):
+        super().__init__()
+
+        # ✅ 替换为新高频细节提取器
+        self.detail_extractor = MultiChannelEdgeExtractor(
+            out_channels_full=64,
+            out_channels_half=64
+        )
+
+        # 编码器（输出3个阶段）
+        self.encoder = timm.create_model(
+            backbone_name,
+            features_only=True,
+            pretrained=False,
+            out_indices=(0, 1, 2),  # stage1, stage2, stage3
+            drop_path_rate=0.1
+        )
+        if pretrained and weight_path and os.path.exists(weight_path):
+            self._load_local_weights(weight_path)
+        elif pretrained:
+            self.encoder = timm.create_model(
+                backbone_name,
+                features_only=True,
+                pretrained=True,
+                out_indices=(0, 1, 2),
+                drop_path_rate=0.1
+            )
+        if freeze_encoder:
+            for p in self.encoder.parameters():
+                p.requires_grad = False
+
+        # 获取通道数（ConvNeXtV2 Base: [128, 256, 512]）
+        encoder_chs = self.encoder.feature_info.channels()
+        self.enc_ch1, self.enc_ch2, self.enc_ch3 = encoder_chs[0], encoder_chs[1], encoder_chs[2]
+
+        # ✅ Enhanced-SES：用 enc2 + detail['half'] 增强 enc3
+        self.enhanced_ses = EnhancedSES(
+            shallow_ch=self.enc_ch2,  # enc2 通道
+            hf_ch=64,  # detail['half'] 通道
+            target_ch=self.enc_ch3  # 注入到 enc3
+        )
+      
+        # ASPP-GCN
+        self.aspp_gcn3 = ASPPGraphFusion(in_channels=self.enc_ch3, out_channels=self.enc_ch3)
+
+        # 解码器
+        self.decoder3 = DecoderStage(self.enc_ch3, self.enc_ch2, 256, dropout_prob)
+        self.decoder2 = DecoderStage(256, self.enc_ch1, 128, dropout_prob)
+        self.decoder1 = DecoderStage(128, 64, 64, dropout_prob)  # 注意：这里 skip 是 details['half']
+
+        # 最终输出
+        self.final_upsample = nn.ConvTranspose2d(64, 64, 2, stride=2)
+        self.final_conv = nn.Sequential(
+            nn.Dropout2d(dropout_prob),
+            nn.Conv2d(64 + 64, num_classes, 1)  # 64 (decoder) + 64 (details['full'])
+        )
+
+    def _load_local_weights(self, weight_path):
+        state_dict = torch.load(weight_path, map_location='cpu')
+        new_state = {k.replace("model.", ""): v for k, v in state_dict.items() if not k.startswith("head.")}
+        missing, unexpected = self.encoder.load_state_dict(new_state, strict=False)
+        print(f"✅ 权重加载完成: 缺失 {len(missing)} | 多余 {len(unexpected)}")
+
+    def forward(self, x):
+        # Step 1: 提取高频细节
+        details = self.detail_extractor(x)  # {'full': [B,64,H,W], 'half': [B,64,H/2,W/2]}
+
+        # Step 2: 编码器前向
+        enc1, enc2, enc3 = self.encoder(x)  # e.g., [B,128,64,64], [B,256,32,32], [B,512,16,16]
+
+        # Step 3: ✅ Enhanced-SES —— 将 detail['half'] 与 enc2 融合，增强 enc3
+        # 先将 detail['half'] 上采样到 enc2 尺寸（原为 H/2 → 需对齐 enc2）
+        hf_half_resized = F.interpolate(details['half'], size=enc2.shape[2:], mode='bilinear', align_corners=False)
+        ses_signal = self.enhanced_ses(enc2, hf_half_resized)  # [B,512,32,32]
+        # 上采样 SES 信号到 enc3 尺寸并加到 enc3
+        ses_up = F.interpolate(ses_signal, size=enc3.shape[2:], mode='bilinear', align_corners=False)
+        enc3_enhanced = enc3 + ses_up
+
+        # Step 4: ASPP-GCN
+        x = self.aspp_gcn3(enc3_enhanced)
+
+        # Step 5: 解码器（注意 decoder1 的 skip 是 details['half']）
+        x = self.decoder3(x, enc2)
+        x = self.decoder2(x, enc1)
+        # 将 details['half'] 作为最后一级 skip（你原设计如此，可保留）
+        x = self.decoder1(x, details['half'])
+
+        # Step 6: 最终上采样 + full-res 细节融合
+        x = self.final_upsample(x)  # [B,64,256,256]
+        x = torch.cat([x, details['full']], dim=1)  # [B,128,256,256]
+        x = self.final_conv(x)  # [B,1,256,256]
+
+        return x
+
+
+# ==============================
+# 测试
+# ==============================
+if __name__ == "__main__":
+    model = ConvNeXtUNet_EGSES(num_classes=1)
+    x = torch.randn(1, 3, 256, 256)
+    y = model(x)
+    print("Output shape:", y.shape)  # torch.Size([1, 1, 256, 256])
