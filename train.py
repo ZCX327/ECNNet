@@ -328,16 +328,6 @@ def main(config_path="config.json"):
         metrics_df = pd.concat([metrics_df, new_row], ignore_index=True)
         metrics_df.to_csv(csv_file, index=False)
 
-        # Save best models
-        if val_dice > best_val_dice and val_loader is not None:
-            best_val_dice = val_dice
-            torch.save(model.state_dict(), best_model_path_val)
-            print(f"✅ New best validation model saved (Dice={val_dice:.4f})")
-
-        if test_dice > best_test_dice and test_loader is not None:
-            best_test_dice = test_dice
-            torch.save(model.state_dict(), best_model_path_test)
-            print(f"✅ New best test model saved (Dice={test_dice:.4f})")
             
         if epoch == config["training"]["epochs"]-1:
             torch.save(model.state_dict(), end_model_path)
